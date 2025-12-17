@@ -81,6 +81,10 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
       return;
     }
 
+    // Track if component is still mounted
+    let isMounted = true;
+    const controller = new AbortController();
+
     // Generate a unique ID for this Shadow DOM instance
     const shadowRootId = `sidd-shadow-${Math.random().toString(36).substring(2, 9)}`;
 
@@ -93,6 +97,7 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
 
     // Helper to render HTML into this Shadow DOM
     const renderHtml = (htmlFragment: string) => {
+      if (!isMounted) return;
       const finalHtml = htmlFragment.replace(/\{\{shadowRootId\}\}/g, shadowRootId);
       const fragment = document.createRange().createContextualFragment(finalHtml);
       root.innerHTML = '';
@@ -126,7 +131,8 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
       fetchPromise = fetch(uiEndpointUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: component_name, props: props })
+        body: JSON.stringify({ name: component_name, props: props }),
+        signal: controller.signal
       })
         .then(res => {
           if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -152,6 +158,9 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
         renderHtml(htmlFragment);
       })
       .catch(err => {
+        // Ignore abort errors (expected on unmount)
+        if (err.name === 'AbortError' || !isMounted) return;
+
         console.error(`[Sidd Agent UI] Failed to load component:`, err);
         setError(err.message || 'Unknown error');
         setLoading(false);
@@ -161,6 +170,12 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
         </div>`;
         if (onComponentError) onComponentError(err, payload);
       });
+
+    // Cleanup on unmount
+    return () => {
+      isMounted = false;
+      controller.abort();
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [componentId]);  // Re-run if componentId changes
 

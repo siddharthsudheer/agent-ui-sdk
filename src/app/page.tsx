@@ -113,6 +113,7 @@ export default function WeatherPage() {
       {/* Chat sidebar - shows conversation history with tool-based components */}
       <CopilotSidebar
         defaultOpen={true}
+        clickOutsideToClose={false}
         labels={{
           title: "Weather Assistant",
           initial: "Ask me about the weather in any city!"
