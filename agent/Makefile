@@ -1,7 +1,7 @@
 .PHONY: run install run-multi run-single run-langgraph test-langgraph
 
 install:
-	uv sync
+	uv sync && cd ui && pnpm i
 
 # Run the single-agent ADK version (default)
 run:
