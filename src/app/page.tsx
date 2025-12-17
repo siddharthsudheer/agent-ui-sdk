@@ -1,9 +1,10 @@
 "use client";
 
-import { useCopilotAction } from "@copilotkit/react-core";
+import { useCopilotAction, useCopilotChat } from "@copilotkit/react-core";
 import { CopilotSidebar } from "@copilotkit/react-ui";
-import { useEffect, useState } from "react";
-import { LoadExternalComponent, preloadUIBundle, useUIStream } from "@/sidd_agent_ui_sdk";
+import { TextMessage, Role } from "@copilotkit/runtime-client-gql";
+import { useEffect, useState, useMemo } from "react";
+import { LoadExternalComponent, preloadUIBundle, useUIStream, StreamContext } from "@/sidd_agent_ui_sdk";
 
 export default function WeatherPage() {
   // Use a consistent session ID for both streaming and CopilotKit
@@ -12,6 +13,16 @@ export default function WeatherPage() {
 
   // Streaming components (Phase 2: full return signature!)
   const { components, connected, error } = useUIStream('http://localhost:8000', sessionId);
+
+  // Get CopilotKit chat to expose to backend components
+  const { appendMessage } = useCopilotChat();
+
+  // Create stream context for backend components (HITL support)
+  const streamContext: StreamContext = useMemo(() => ({
+    sendMessage: (message: string) => {
+      appendMessage(new TextMessage({ content: message, role: Role.User }));
+    },
+  }), [appendMessage]);
 
   useEffect(() => {
     preloadUIBundle('http://localhost:8000', 'weather_app');
@@ -38,7 +49,7 @@ export default function WeatherPage() {
             animationFillMode: 'both',
           }}
         >
-          <LoadExternalComponent payload={payload} apiUrl="http://localhost:8000" />
+          <LoadExternalComponent payload={payload} apiUrl="http://localhost:8000" streamContext={streamContext} />
         </div>
       );
     },
@@ -72,6 +83,7 @@ export default function WeatherPage() {
                   <LoadExternalComponent
                     payload={component}
                     apiUrl="http://localhost:8000"
+                    streamContext={streamContext}
                   />
                 </div>
               ))}

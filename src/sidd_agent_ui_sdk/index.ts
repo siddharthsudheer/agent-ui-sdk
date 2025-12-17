@@ -35,6 +35,7 @@
  */
 
 export { LoadExternalComponent } from './LoadExternalComponent';
+export type { StreamContext } from './LoadExternalComponent';
 export { preloadUIBundle, preloadUIBundles } from './preload';
 export { useUIStream } from './useUIStream';
 export type { DynamicUIPayload } from './types';

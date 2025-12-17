@@ -50,8 +50,12 @@ bun.lockb
 
 # python
 agent/venv/
-agent/__pycache__/
-agent/libs/__pycache__/
+agent/__pycache__
+agent/sidd_agent_ui_sdk/__pycache__
+agent/libs/__pycache__
 agent/.venv/
+agent/ui/node_modules/
+agent/*.db
+agent/*.sqlite*
 
 CLAUDE.md

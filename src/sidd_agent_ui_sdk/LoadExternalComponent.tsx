@@ -7,9 +7,24 @@
 import React, { useRef, useEffect, useState } from 'react';
 import type { DynamicUIPayload } from './types';
 
+/**
+ * Stream context for HITL (Human-in-the-Loop) interactions.
+ * Backend components access this via window.__SIDD_STREAM__
+ */
+export interface StreamContext {
+  /** Send a message to the chat (for retry, user input, etc.) */
+  sendMessage?: (message: string) => void;
+  /** Resume from an interrupt with a value */
+  resume?: (value: unknown) => void;
+  /** Current interrupt state (if any) */
+  interrupt?: unknown;
+}
+
 interface LoadExternalComponentProps {
   payload: DynamicUIPayload;
   apiUrl?: string;
+  /** Stream context for HITL - exposed on window.__SIDD_STREAM__ */
+  streamContext?: StreamContext;
   onComponentLoad?: (payload: DynamicUIPayload) => void;
   onComponentError?: (error: Error, payload: DynamicUIPayload) => void;
   containerStyle?: React.CSSProperties;
@@ -18,31 +33,16 @@ interface LoadExternalComponentProps {
 
 const DEFAULT_API_URL = "http://localhost:8000";
 
-// Global cache to track rendered components across all instances
-// This prevents duplicate renders even when CopilotKit re-renders the entire conversation
-// or when React Strict Mode unmounts/remounts components
-const renderedComponents = new Set<string>();
+// Global cache for fetched HTML fragments
+// This allows multiple component instances with the same componentId to render without re-fetching
+const htmlCache = new Map<string, string>();
 
-// Module-level function to atomically register a component
-// Returns true if registration succeeded (component should render), false if already registered
-function tryRegisterComponent(componentId: string): boolean {
-  // Atomic check-and-set to prevent race conditions
-  if (renderedComponents.has(componentId)) {
-    console.log('[Sidd Agent UI] Component already rendered, skipping:', componentId);
-    return false;
-  }
-  // Mark as rendered IMMEDIATELY (not when fetch completes)
-  // This prevents React Strict Mode's unmount+remount from creating duplicates
-  renderedComponents.add(componentId);
-  console.log('[Sidd Agent UI] Component registered and marked as rendered:', componentId);
-  return true;
-}
+// Track in-flight fetches to prevent duplicate requests
+const pendingFetches = new Map<string, Promise<string>>();
 
 // Helper to normalize props for comparison (handles different key orders)
 function normalizeProps(props: any): any {
   if (!props || typeof props !== 'object') return props;
-
-  // Sort keys to ensure {a:1, b:2} and {b:2, a:1} are identical
   return Object.keys(props).sort().reduce((acc, key) => {
     acc[key] = props[key];
     return acc;
@@ -52,6 +52,7 @@ function normalizeProps(props: any): any {
 const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
   payload,
   apiUrl = DEFAULT_API_URL,
+  streamContext,
   onComponentLoad,
   onComponentError,
   containerStyle = {},
@@ -63,46 +64,51 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
 
   const { graph_name, component_name, props } = payload;
 
+  // Expose stream context on window for backend components to access
+  useEffect(() => {
+    if (streamContext) {
+      (window as any).__SIDD_STREAM__ = streamContext;
+    }
+  }, [streamContext]);
+
   // Normalize props by sorting keys to handle different key orders
   const normalizedProps = normalizeProps(props);
   const componentId = `${graph_name}:${component_name}:${JSON.stringify(normalizedProps)}`;
 
-  console.log('[Sidd Agent UI] Props:', props, '→ Normalized:', normalizedProps, '→ ID:', componentId);
-
-  // Register component atomically during render (before useEffect)
-  // This prevents race conditions when multiple instances are created simultaneously
-  const [shouldRender] = useState(() => tryRegisterComponent(componentId));
-
   useEffect(() => {
-    // If not registered (already exists), skip rendering
-    if (!shouldRender) {
-      console.log('[Sidd Agent UI] Component not registered, skipping render:', componentId);
-      setLoading(false);
-      return;
-    }
-
     const hostElement = hostRef.current;
     if (!hostElement) {
-      console.error('[Sidd Agent UI] Host ref is null');
       return;
     }
 
-    console.log('[Sidd Agent UI] Starting to load component:', componentId);
-
-    // Generate a unique ID for the Shadow DOM host
+    // Generate a unique ID for this Shadow DOM instance
     const shadowRootId = `sidd-shadow-${Math.random().toString(36).substring(2, 9)}`;
 
     // Ensure Shadow Root exists on the host element
     const root = hostElement.shadowRoot ?? hostElement.attachShadow({ mode: "open" });
 
-    // Register shadow root in global registry BEFORE fetching script
-    // This ensures the bundle can find it even if the host element is unmounted
+    // Register shadow root in global registry
     (window as any).__SIDD_SHADOW_ROOTS__ = (window as any).__SIDD_SHADOW_ROOTS__ || new Map();
     (window as any).__SIDD_SHADOW_ROOTS__.set(shadowRootId, root);
 
-    console.log('[Sidd Agent UI] Registered shadow root:', shadowRootId);
+    // Helper to render HTML into this Shadow DOM
+    const renderHtml = (htmlFragment: string) => {
+      const finalHtml = htmlFragment.replace(/\{\{shadowRootId\}\}/g, shadowRootId);
+      const fragment = document.createRange().createContextualFragment(finalHtml);
+      root.innerHTML = '';
+      root.appendChild(fragment);
+      setLoading(false);
+      if (onComponentLoad) onComponentLoad(payload);
+    };
 
-    // Clear previous content and show loading indicator
+    // Check if we already have cached HTML for this component
+    const cachedHtml = htmlCache.get(componentId);
+    if (cachedHtml) {
+      renderHtml(cachedHtml);
+      return;
+    }
+
+    // Show loading indicator while fetching
     root.innerHTML = `
       <div style="padding: 20px; color: #666; text-align: center; font-family: sans-serif;">
         <div style="font-size: 14px; margin-bottom: 8px;">⚡ Loading ${component_name} component...</div>
@@ -110,72 +116,53 @@ const LoadExternalComponentInner: React.FC<LoadExternalComponentProps> = ({
       </div>
     `;
 
-    // Construct the URL for the HTML fragment (POST request)
-    const uiEndpointUrl = `${apiUrl}/ui/${graph_name}`;
+    // Check if there's already a fetch in progress for this componentId
+    let fetchPromise = pendingFetches.get(componentId);
 
-    console.log(`[Sidd Agent UI] Fetching component from: ${uiEndpointUrl}`);
+    if (!fetchPromise) {
+      // Start new fetch
+      const uiEndpointUrl = `${apiUrl}/ui/${graph_name}`;
 
-    // Request the HTML fragment from the server
-    fetch(uiEndpointUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: component_name, props: props })
-    })
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-        }
-        return res.text();
+      fetchPromise = fetch(uiEndpointUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: component_name, props: props })
       })
+        .then(res => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+          return res.text();
+        })
+        .then(htmlFragment => {
+          // Cache the response for other instances
+          htmlCache.set(componentId, htmlFragment);
+          pendingFetches.delete(componentId);
+          return htmlFragment;
+        })
+        .catch(err => {
+          pendingFetches.delete(componentId);
+          throw err;
+        });
+
+      pendingFetches.set(componentId, fetchPromise);
+    }
+
+    // Wait for the fetch (either new or existing)
+    fetchPromise
       .then(htmlFragment => {
-        console.log(`[Sidd Agent UI] Received HTML fragment for shadowRootId:`, shadowRootId);
-
-        // Replace the placeholder with the actual shadowRootId
-        const finalHtml = htmlFragment.replace(/\{\{shadowRootId\}\}/g, shadowRootId);
-
-        console.log(`[Sidd Agent UI] Final HTML:`, finalHtml);
-
-        // Use createContextualFragment to safely parse the HTML and its <script> tag
-        const fragment = document
-          .createRange()
-          .createContextualFragment(finalHtml);
-
-        root.innerHTML = ''; // Clear 'Loading...' message
-        root.appendChild(fragment);
-
-        console.log(`[Sidd Agent UI] Injected script into shadow DOM for component: ${component_name}`);
-
-        // Fetch complete
-        setLoading(false);
-
-        // Call success callback
-        if (onComponentLoad) {
-          onComponentLoad(payload);
-        }
+        renderHtml(htmlFragment);
       })
       .catch(err => {
         console.error(`[Sidd Agent UI] Failed to load component:`, err);
-        const errorMsg = err.message || 'Unknown error';
-        setError(errorMsg);
+        setError(err.message || 'Unknown error');
         setLoading(false);
-
         root.innerHTML = `<div style="padding: 10px; color: #dc2626; border: 1px solid #fca5a5; border-radius: 4px; background: #fee2e2;">
           <strong>Error loading UI component:</strong><br/>
-          ${errorMsg}
+          ${err.message || 'Unknown error'}
         </div>`;
-
-        // Call error callback
-        if (onComponentError) {
-          onComponentError(err, payload);
-        }
+        if (onComponentError) onComponentError(err, payload);
       });
-
-    // Cleanup function
-    return () => {
-      // Nothing to clean up - component is marked as rendered permanently
-      // This ensures React Strict Mode's unmount+remount doesn't create duplicates
-    };
-  }, [componentId, apiUrl, shouldRender, component_name, graph_name, props, onComponentLoad, onComponentError]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [componentId]);  // Re-run if componentId changes
 
   // Return the host div element to render in the chat
   return (
